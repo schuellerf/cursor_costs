@@ -1,5 +1,7 @@
 # Cursor Spend Widget Helper
 
+Unofficial helper. Licensed under [MIT](LICENSE). It only uses **your** local Firefox `cursor.com` session (no API key, no stored token). The dashboard endpoints are undocumented and can change; this is not affiliated with Cursor.
+
 Prints this month’s Cursor spend for the Firefox-logged-in user:
 
 ```
