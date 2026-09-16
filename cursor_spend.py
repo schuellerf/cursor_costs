@@ -35,8 +35,21 @@ class SmartRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+DASHBOARD_URL = "https://cursor.com/dashboard"
+
+
+def ask_relogin(detail):
+    print(f"Please go to {DASHBOARD_URL}")
+    if not detail.endswith("\n"):
+        detail += "\n"
+    sys.stderr.write(detail)
+
+
 def get_firefox_cursor_cookie():
-    """Finds and extracts WorkosCursorSessionToken from Firefox profiles on Linux."""
+    """Finds WorkosCursorSessionToken in Firefox profiles on Linux.
+
+    Returns (cookie, None) or (None, stderr detail).
+    """
     search_patterns = [
         os.path.expanduser("~/.mozilla/firefox/*/cookies.sqlite"),
         os.path.expanduser(
@@ -52,9 +65,13 @@ def get_firefox_cursor_cookie():
         cookie_files.extend(glob.glob(pattern))
 
     if not cookie_files:
-        return None
+        return None, (
+            "No Firefox cookies.sqlite found "
+            "(~/.mozilla/firefox, Flatpak, or Snap).\n"
+        )
 
     cookie_files.sort(key=os.path.getmtime, reverse=True)
+    db_errors = []
 
     for db_path in cookie_files:
         temp_db = os.path.join(
@@ -75,14 +92,54 @@ def get_firefox_cursor_cookie():
             os.remove(temp_db)
 
             if row and row[0]:
-                return row[0]
+                return row[0], None
         except Exception as e:
-            sys.stderr.write(f"Error reading DB {db_path}: {e}\n")
+            db_errors.append(f"{db_path}: {e}")
             if os.path.exists(temp_db):
                 os.remove(temp_db)
             continue
 
-    return None
+    detail = (
+        "WorkosCursorSessionToken missing from Firefox cookies "
+        f"({len(cookie_files)} profile DB(s) checked).\n"
+        "Log in with Firefox to refresh the session cookie.\n"
+    )
+    if db_errors:
+        detail += "Cookie DB errors:\n" + "\n".join(db_errors) + "\n"
+    return None, detail
+
+
+def http_error_detail(error):
+    try:
+        body = error.read().decode("utf-8")
+    except Exception:
+        body = ""
+    reason = f"HTTPError {error.code} ({error.reason})"
+    if body:
+        reason += f":\n{body}"
+    return reason, body
+
+
+def is_bad_session(status, body):
+    if status not in (401, 403):
+        return False
+    try:
+        payload = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        return True
+    err = payload.get("error") or {}
+    if not isinstance(err, dict):
+        return True
+    if err.get("message") == "Team ID is required":
+        return False
+    details = err.get("details") or []
+    for item in details:
+        inner = (item or {}).get("details") or {}
+        if inner.get("detail") == "Team ID is required":
+            return False
+        if (inner.get("analyticsMetadata") or {}).get("actionRequired") == "login":
+            return True
+    return status == 401
 
 
 def browser_headers(cookie):
@@ -200,12 +257,9 @@ def resolve_team_id(opener, cookie):
 
 
 def main():
-    cookie = get_firefox_cursor_cookie()
+    cookie, cookie_err = get_firefox_cursor_cookie()
     if not cookie:
-        print("Cursor Err: No Cookie")
-        sys.stderr.write(
-            "Error: WorkosCursorSessionToken not found in Firefox cookies.\n"
-        )
+        ask_relogin(cookie_err)
         return
 
     opener = urllib.request.build_opener(SmartRedirectHandler)
@@ -220,7 +274,7 @@ def main():
             if spend is None:
                 print("Cursor Err: No Team")
                 return
-            print(f"Cursor: ${spend:.2f}")
+            print(f"Cursor:\n${spend:.2f}")
             return
 
         spend_data = dashboard_json(
@@ -233,24 +287,25 @@ def main():
         if spend is None:
             print("Cursor Err: No User")
             return
-        print(f"Cursor: ${spend:.2f}")
+        print(f"Cursor:\n${spend:.2f}")
 
     except urllib.error.HTTPError as e:
-        print(f"Cursor Err: {e.code}")
-        try:
-            body = e.read().decode("utf-8")
-            sys.stderr.write(
-                f"HTTPError {e.code} ({e.reason}):\n{body}\n"
+        reason, body = http_error_detail(e)
+        if is_bad_session(e.code, body):
+            ask_relogin(
+                "Session cookie was rejected by Cursor "
+                f"(log in with Firefox to refresh it).\n{reason}\n"
             )
-        except Exception:
-            sys.stderr.write(f"HTTPError {e.code} ({e.reason})\n")
+            return
+        print(f"Cursor Err:\n{e.code}")
+        sys.stderr.write(reason + "\n")
 
     except urllib.error.URLError as e:
-        print("Cursor Err: Network")
+        print("Cursor Err:\nNetwork")
         sys.stderr.write(f"URLError: {e.reason}\n")
 
     except Exception:
-        print("Cursor Err: Unknown")
+        print("Cursor Err:\nUnknown")
         traceback.print_exc(file=sys.stderr)
 
 
